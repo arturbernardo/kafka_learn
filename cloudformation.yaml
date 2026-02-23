@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Kafka 4.2.0 + Conduktor Console on Amazon Linux 2023 (SSM AMI)
+Description: Kafka 4.2.0 (KRaft single node) + Conduktor Console + Postgres on Amazon Linux 2023
 
 Parameters:
   KeyName:
@@ -11,7 +11,6 @@ Parameters:
     Default: t3.medium
 
 Resources:
-
   KafkaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -24,6 +23,10 @@ Resources:
         - IpProtocol: tcp
           FromPort: 9092
           ToPort: 9092
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 19092
+          ToPort: 19092
           CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
           FromPort: 8080
@@ -43,8 +46,11 @@ Resources:
           Ebs:
             VolumeSize: 20
             VolumeType: gp3
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: |
           #!/bin/bash
           set -euo pipefail
 
@@ -54,24 +60,45 @@ Resources:
           systemctl enable docker
           systemctl start docker
 
-          # --- Install Kafka 4.2.0
+          # -------- IMDSv2
+          TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+          PUB=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+
+          PRIV=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/local-ipv4)
+
+          echo "PUBLIC=$PUB"
+          echo "PRIVATE=$PRIV"
+
+          # -------- Install Kafka 4.2.0
           cd /opt
-          wget https://dlcdn.apache.org/kafka/4.2.0/kafka_2.13-4.2.0.tgz
+          wget -q https://dlcdn.apache.org/kafka/4.2.0/kafka_2.13-4.2.0.tgz
           tar -xzf kafka_2.13-4.2.0.tgz
           mv kafka_2.13-4.2.0 kafka
 
           mkdir -p /var/lib/kafka
 
-          # --- Kafka KRaft configuration
+          # Se não houver IP público (ou vier vazio), faz fallback pro privado
+          if [ -z "$PUB" ]; then
+            PUB="$PRIV"
+          fi
+
+          # -------- Kafka KRaft configuration (INTERNAL/EXTERNAL)
           cat > /opt/kafka/config/server.properties <<EOF
           process.roles=broker,controller
           node.id=1
           controller.quorum.voters=1@localhost:9093
-          listeners=PLAINTEXT://:9092,CONTROLLER://:9093
-          inter.broker.listener.name=PLAINTEXT
-          advertised.listeners=PLAINTEXT://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):9092
+
+          listeners=INTERNAL://:9092,EXTERNAL://:19092,CONTROLLER://:9093
+          advertised.listeners=INTERNAL://$PRIV:9092,EXTERNAL://$PUB:19092
+
+          inter.broker.listener.name=INTERNAL
           controller.listener.names=CONTROLLER
-          listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          listener.security.protocol.map=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+
           log.dirs=/var/lib/kafka
           num.partitions=3
           offsets.topic.replication.factor=1
@@ -79,10 +106,12 @@ Resources:
           transaction.state.log.min.isr=1
           EOF
 
-          /opt/kafka/bin/kafka-storage.sh format -t $(/opt/kafka/bin/kafka-storage.sh random-uuid) -c /opt/kafka/config/server.properties
+          /opt/kafka/bin/kafka-storage.sh format \
+            -t "$(/opt/kafka/bin/kafka-storage.sh random-uuid)" \
+            -c /opt/kafka/config/server.properties
 
-          # --- systemd service
-          cat > /etc/systemd/system/kafka.service <<EOF
+          # -------- systemd service
+          cat > /etc/systemd/system/kafka.service <<'EOF'
           [Unit]
           Description=Apache Kafka
           After=network.target
@@ -101,7 +130,7 @@ Resources:
           systemctl enable kafka
           systemctl start kafka
 
-          # --- Conduktor Console + Postgres via Docker
+          # -------- Conduktor Console + Postgres
           docker network create conduktor-net || true
 
           docker rm -f conduktor-postgres || true
@@ -124,5 +153,13 @@ Resources:
 
 Outputs:
   PublicIP:
-    Description: EC2 Public IP
+    Description: EC2 Public IP (if assigned)
     Value: !GetAtt KafkaInstance.PublicIp
+
+  ConduktorURL:
+    Description: Conduktor Console URL
+    Value: !Sub "http://${KafkaInstance.PublicIp}:8080"
+
+  KafkaExternalBootstrap:
+    Description: Kafka bootstrap for external clients (from your laptop)
+    Value: !Sub "${KafkaInstance.PublicIp}:19092"
